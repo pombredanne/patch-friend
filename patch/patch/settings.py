@@ -15,7 +15,6 @@ import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/1.8/howto/deployment/checklist/
 
@@ -23,10 +22,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRET_KEY = '8xgmur-gapivo71bt5*gi7sm=mnf5x9emt4f7oy9q7o=uyz2fn'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = []
-
+ALLOWED_HOSTS = ['*']
 
 # Application definition
 
@@ -80,14 +78,21 @@ WSGI_APPLICATION = 'patch.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql_psycopg2',
+#         'NAME': 'patch',
+#         'USER': 'patch',
+#         'PASSWORD': 'patch',
+#         'HOST': 'localhost',
+#         'PORT': '',
+#     }
+# }
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'patch',
-        'USER': 'patch',
-        'PASSWORD': 'patch',
-        'HOST': 'localhost',
-        'PORT': '',
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(BASE_DIR, '../db/db.sqlite3'),
     }
 }
 
@@ -115,12 +120,20 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/1.8/howto/static-files/
 
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 65535
 STATIC_URL = '/static/'
 
+# Configuration for hotplate-hosts
+
+OSQUERY_ENROLL_SECRET = "hotplate"
+FIX_REASONS = (
+    ('removed', 'Package removed'),
+)
 
 ADVISORY_SOURCES = (
     ('ubuntu', 'Ubuntu'),
     ('debian', 'Debian'),
+    ('hostinfo', 'What?')
 )
 
 # For advisories that have been triaged by a human
@@ -142,11 +155,13 @@ ADVISORY_SEVERITY_CLASSES = (
 
 # Current stable releases
 RELEASES = (
-    ('squeeze', 'Debian Squeeze 6.0'),
-    ('wheezy', 'Debian Wheezy 7.0'),
-    ('jessie', 'Debian Jessie 8.0'),
+    ('squeeze', 'Debian Squeeze 6'),
+    ('wheezy', 'Debian Wheezy 7'),
+    ('jessie', 'Debian Jessie 8'),
+    ('stretch', 'Debian Stretch 9'),
     ('precise', 'Ubuntu Precise LTS 12.04'),
-    ('trusty', 'Ubuntu Trusty LTS 14.04',)
+    ('trusty', 'Ubuntu Trusty LTS 14.04',),
+    ('xenial', 'Ubuntu Xenial LTS 16.04',)
 )
 
 # Data source plugins
@@ -165,7 +180,3 @@ SOURCE_PACKAGE_DETAIL_URLS = {
 }
 
 APTGET_COMMAND_STUB = 'sudo apt-get --only-upgrade install'
-
-ADVISORYCACHE_KEYS = {'affected_hosts': 'affected_hosts_%s',
-    'resolved_hosts': 'resolved_hosts_%s',
-    'unresolved_hosts': 'unresolved_hosts_%s'}

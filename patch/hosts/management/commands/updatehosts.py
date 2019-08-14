@@ -15,8 +15,15 @@ from django.db import transaction
 from django.utils import timezone
 
 import requests
+from hashlib import sha256
 
 from hosts.models import *
+
+import logging
+if settings.DEBUG is True:
+    logging.basicConfig(format='%(asctime)s | %(levelname)s: %(message)s', level=logging.DEBUG)
+else:
+    logging.basicConfig(format='%(asctime)s | %(levelname)s: %(message)s', level=logging.ERROR)
 
 class HostinfoClient(object):
 
@@ -24,13 +31,17 @@ class HostinfoClient(object):
         self.hostinfo_base_url = hostinfo_base_url or 'http://hostinfo/'
 
     def all_hosts_and_packages(self):
-        return json.loads(requests.get("%s/cgi-bin/hosts-and-packages.pl" % self.hostinfo_base_url).content)
+        return requests.get("%s/cgi-bin/hosts-and-packages.pl" % self.hostinfo_base_url).json()
 
 class Command(BaseCommand):
     help = 'Update all sources of hosts and packages'
 
     @transaction.atomic
     def _update_hostinfo_hosts(self):
+
+        RESET_HOSTS = False
+        if RESET_HOSTS:
+            Package.objects.all().delete()
 
         default_customer, created = Customer.objects.get_or_create(name='catalyst')
         if created:
@@ -39,27 +50,40 @@ class Command(BaseCommand):
         self.stdout.write("  Wrangling all host data (this will take a minute or two)... ", ending='')
 
         all_database_hosts = Host.objects.filter(source='hostinfo')
+        # logging.debug('all_database_hosts' + str(all_database_hosts))
+        # logging.info('all_database_hosts done')
         all_hostinfo_hosts = self.hostinfo_client.all_hosts_and_packages()
+        # logging.debug('all_hostinfo_hosts' + str(all_hostinfo_hosts))
+        # logging.info('all_hostinfo_hosts done')
 
-        all_database_fingerprints = set([host.hostinfo_fingerprint for host in all_database_hosts])
-        all_hostinfo_fingerprints = set([host['metadata']['fingerprint'] for hostname, host in all_hostinfo_hosts.iteritems()])
+
+        all_database_fingerprints = {host.hostinfo_fingerprint for host in all_database_hosts}
+        all_hostinfo_fingerprints = {host['metadata']['fingerprint'] for hostname, host in all_hostinfo_hosts.items()}
+
 
         new_hosts = all_hostinfo_fingerprints - all_database_fingerprints
+        logging.debug('New hosts: ' + str(new_hosts))
         hosts_to_remove = all_database_fingerprints - all_hostinfo_fingerprints
+        logging.debug('Hosts to remove: ' + str(hosts_to_remove))
 
         self.stdout.write("OK")
 
         self.stdout.write("  %i hosts found (%i new)" % (len(all_hostinfo_fingerprints), len(new_hosts)))
 
-        for hostname, host_data in all_hostinfo_hosts.iteritems():
+        for hostname, host_data in all_hostinfo_hosts.items():
+
+            # Gets a hash of the host's attributes
+            hostinfo_host_hash = sha256(json.dumps(sorted(host_data['machineinfo'], key=sorted), sort_keys=True).encode('utf-8')).hexdigest()
+
             self.stdout.write("      updating %s..." % hostname, ending='')
             db_host, db_host_created = Host.objects.get_or_create(hostinfo_fingerprint=host_data['metadata']['fingerprint'], defaults={'hostinfo_id': host_data['metadata']['hostid'], 'customer': default_customer, 'name': hostname})
 
-            if db_host_created:
+            if db_host_created or (hostinfo_host_hash != db_host.host_hash):
                 tags = []
                 customer = None
+                HostImportedAttribute.objects.filter(host=db_host).delete()  # Clear any previous attributes that there might have been
                 for attribute in host_data['machineinfo']:
-                    db_importedattributes, db_importedattributes_created = HostImportedAttribute.objects.get_or_create(host=db_host, key=attribute['key'], value=attribute['value'])
+                    # db_importedattributes, db_importedattributes_created = HostImportedAttribute.objects.get_or_create(host=db_host, key=attribute['key'], value=attribute['value'])
 
                     if attribute['key'] == 'CLIENT':
                         value = attribute['value'].strip()
@@ -82,9 +106,13 @@ class Command(BaseCommand):
                         db_tag, db_tag_created = Tag.objects.get_or_create(name=tag, customer=db_customer)
                         db_host.tags.add(db_tag)
 
+                db_host.host_hash = hostinfo_host_hash
+                # logging.debug('Hash is different')
+
             try:
                 release = host_data['metadata']['release'].split(':')[1]
             except:
+                logging.error(hostname + ' has no release!')
                 release = ''
 
             try:
@@ -93,6 +121,7 @@ class Command(BaseCommand):
                     architecture = architecture.replace('i686','i386')
                     architecture = architecture.replace('x86_64','amd64')
             except:
+                logging.error(hostname + ' has no architecture!')
                 architecture = ''
 
             db_host.release = release
@@ -100,9 +129,15 @@ class Command(BaseCommand):
             db_host.source = 'hostinfo'
             db_host.save()
 
-            Package.objects.filter(host__pk=db_host.pk).delete()
-            pkgs = []
 
+            # Does the packages
+            hostinfo_packages = set()
+
+            logging.info("Getting packages from databse...")
+            database_packages = set(Package.objects.filter(host=db_host).values_list("name", "version", "architecture"))
+            # logging.debug(database_packages)
+
+            # for every package in hostinfo host...
             for package in host_data['packages']:
                 # only 'ii' packages are imported
                 if package['status'] != 'ii':
@@ -115,17 +150,40 @@ class Command(BaseCommand):
                     package_architecture = architecture
                     package_name = package['name']
 
-                pkgs.append(Package(name=package_name, version=package['version'], host=db_host, architecture=package_architecture))
+                hostinfo_packages.add((package_name, package['version'], package_architecture))
 
-            Package.objects.bulk_create(pkgs)
+
+            # Any packages that are in hostinfo but not in database will be added to database
+            packages_to_add = hostinfo_packages - database_packages
+            # logging.debug("\n\npackages to add: " + str(packages_to_add))
+
+            # Any packages that are /not/ in hostinfo but are in database have been removed, so will be deleted from database
+            packages_to_remove = database_packages - hostinfo_packages
+            # logging.debug("packages to remove: " + str(packages_to_remove))
+
+            if RESET_HOSTS:
+                # Add all packages from hostinfo (all packages have been previously removed)
+                for package in hostinfo_packages:
+                    Package(name=package[0], version=package[1], host=db_host, architecture=package[2]).save()
+
+            else:
+                # Removes each package that is in packages_to_remove from the database
+                for package in packages_to_remove:
+                    Package.objects.filter(name=package[0], version=package[1], host=db_host, architecture=package[2]).delete()
+
+                # Adds all the package from packages_to_add into the database
+                for package in packages_to_add:
+                    Package(name=package[0], version=package[1], host=db_host, architecture=package[2]).save()
+
+
             self.stdout.write("Done")
 
         self.stdout.write("  %i removed hosts" % len(hosts_to_remove))
         Host.objects.filter(hostinfo_fingerprint__in=hosts_to_remove).delete()
 
         # entries in advisories_cache are only valid for the hostinfo run they were generated against
-        self.stdout.write("  clearing advisories cache")
-        cache.clear()
+        # self.stdout.write("  clearing advisories cache")
+        # cache.clear()
 
     def handle(self, *args, **options):
         self.stdout.write(self.style.MIGRATE_HEADING("Updating hosts from hostinfo..."))

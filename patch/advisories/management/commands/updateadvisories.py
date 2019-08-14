@@ -1,8 +1,11 @@
 from datetime import datetime
 import bz2
+import lzma
 import json
 import os
 import re
+
+from bs4 import BeautifulSoup
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -10,24 +13,40 @@ from django.db import transaction
 
 from dateutil.parser import parse as dateutil_parse
 import deb822
+
+import apt_inst
+import apt
+
 import pytz
 import requests
 import svn.remote
 
 from advisories.models import *
 
+import logging
+# from patch import settings
+
+if settings.DEBUG is True:
+    logging.basicConfig(format='%(asctime)s | %(levelname)s: %(message)s', level=logging.DEBUG)
+else:
+    logging.basicConfig(format='%(asctime)s | %(levelname)s: %(message)s', level=logging.ERROR)
+
+
+
 class DebianFeed(object):
     """
     Syncs additions to the official DSA list in to the local database, as well as retrieving and parsing metadata about each one.
     """
 
-    def __init__(self, secure_testing_url=None, cache_location=None, releases=None, architectures=None, snapshot_url=None, security_apt_url=None):
+    def __init__(self, secure_testing_url=None, cache_location=None, releases=None, architectures=None, snapshot_url=None, security_apt_url=None, list_location=None):
         self.secure_testing_url = secure_testing_url or "svn://anonscm.debian.org/svn/secure-testing"
         self.client = svn.remote.RemoteClient(self.secure_testing_url)
         self.cache_location = cache_location or "%s/advisory_cache/dsa" % settings.BASE_DIR
         self.releases = releases or (
+            # 'squeeze',
             'wheezy',
             'jessie',
+            'stretch',
         )
         self.architectures = architectures or (
             'i386',
@@ -36,6 +55,7 @@ class DebianFeed(object):
         )
         self.snapshot_url = snapshot_url or "http://snapshot.debian.org"
         self.security_apt_url = security_apt_url or "http://security.debian.org/debian-security"
+        self.list_location = list_location or "data/DSA/list"
 
     def _update_svn_repository(self):
         """
@@ -45,12 +65,13 @@ class DebianFeed(object):
         try:
             os.makedirs(self.cache_location)
         except OSError: # directory already exists
+            # XXX: permission denied, full, etc.
             pass
 
         try:
-            dsa_list = self.client.cat('data/DSA/list')
-            with open('%s/list' % self.cache_location, 'w') as dsa_list_file:
-                dsa_list_file.write(dsa_list)
+            advisory_list = self.client.cat(self.list_location).decode('utf-8')
+            with open('%s/list' % self.cache_location, 'w') as advisory_list_file:
+                advisory_list_file.write(advisory_list)
         except ValueError:
             raise Exception("unable to retrieve data from SVN")
         except:
@@ -58,26 +79,36 @@ class DebianFeed(object):
 
     def _parse_svn_advisories(self):
         """
-        Parse the local cache of the DSA list.
+        Parse the local cache of the DSA/DLA list.
         """
 
-        dsas = {}
-        with open('%s/list' % self.cache_location) as dsa_list_file:
-            dsa = ''
+        advisories = {}
+        with open('%s/list' % self.cache_location) as advisory_list_file:
+            advisory = ''
             packages = {}
-            for line in dsa_list_file:
+            for line in advisory_list_file:
 
                 # minimal state machine follows
-                if line.startswith('['): # start of the DSA
-                    if dsa != '' and len(packages) > 0: # at least one complete DSA parsed
-                        dsas[dsa] = {
+                if line.startswith('['): # start of the DSA/DLA
+                    if advisory != '' and len(packages) > 0: # at least one complete DSA/DLA parsed
+                        advisories[advisory] = {
                             'packages': packages,
                             'description': description,
                             'issued': issued,
                         }
+                        logging.debug(advisories[advisory])
                     issued = pytz.utc.localize(dateutil_parse(line.split('] ')[0].strip('[')))
-                    dsa = line.split('] ')[-1].split()[0] # upstream ID of DSA
-                    description = line.split(' - ')[-1].strip() if ' - ' in line else '' # description if it exists, otherwise empty
+                    advisory = line.split('] ')[-1].split()[0] # upstream ID of DSA/DLA
+                    '''
+                    there are at least two advisories, DLA-359-1 and DLA-73-1, which don't
+                    follow the "[<date>] <DLA #> <source package> - <description>" format,
+                    hence the following code.
+                    '''
+                    if ' - ' in line:
+                        description = line.split(' - ')[-1].strip()
+                    else:
+                        description = line.split(' ', 5)[-1].strip()
+
                     packages = {}
                 elif line.startswith('\t['): # source package name for a particular release
 
@@ -99,17 +130,28 @@ class DebianFeed(object):
                         version = line.split()[3]
 
                     source_package = line.split()[2]
+                    logging.debug('source package: ' + str(source_package))
                     if source_package not in packages:
                         packages[source_package] = {}
                     packages[source_package][release] = version
-        return dsas
+        return advisories
 
-    @transaction.atomic
+    # @transaction.atomic
     def update_local_database(self):
         """
         Update the local repository, parse it and add any new advisories to the local database.
         """
-        print "  Updating security repository data...",
+
+        print("  Updating DSA RDF feed... ", end='')
+        try:
+            dsa_rdf_soup = BeautifulSoup(requests.get('https://www.debian.org/security/dsa-long').content, 'html.parser')
+            dsa_descriptions = {i.attrs['rdf:about'].split('/')[-1].lower():BeautifulSoup(i.description.text, 'html.parser').get_text().strip() for i in dsa_rdf_soup.find_all('item')}
+            print("OK")
+        except:
+            print("could not update DSA RDF feed")
+            dsa_descriptions = {}
+
+        print("  Updating security repository data... ", end='')
 
         release_metadata = {}
         source_packages = {}
@@ -117,13 +159,42 @@ class DebianFeed(object):
         # grab the release metadata from the repository
         for release_name in self.releases:
             release_metadata[release_name] = deb822.Release(requests.get("%s/dists/%s/updates/Release" % (self.security_apt_url, release_name)).text)
+            # print(release_metadata[release_name])
+
 
         # grab the binary package metadata for the desired architectures
-        for release_name, release_metadatum in release_metadata.iteritems():
+        # this section attempts to make a reverse mapping for working out what binary packages a particular source package builds
+        for release_name, release_metadatum in release_metadata.items():
+
+            # Chooses which filetype to use
+            if 'Packages.xz\n' in str(release_metadatum):
+                package_filetype = 'xz'
+            elif 'Packages.bz2\n' in str(release_metadatum):
+                package_filetype = 'bz2'
+            elif 'Packages.gz\n' in str(release_metadatum):
+                package_filetype = 'gz'
+            else:
+                # TODO Use no compression
+                logging.debug('Using no compression')
+                package_filetype = 'bz2'
+                pass
+
+            # print('Filetype is: ' + package_filetype)
+
             for component in release_metadatum['Components'].split():
                 for architecture in [architecture for architecture in release_metadatum['Architectures'].split() if architecture in self.architectures]:
-                    packages_url = "%s/dists/%s/%s/binary-%s/Packages.bz2" % (self.security_apt_url, release_name, component, architecture)
-                    packages = deb822.Deb822.iter_paragraphs(bz2.decompress(requests.get(packages_url).content))
+
+                    # Gets and decompresses the package data
+                    packages_url = "%s/dists/%s/%s/binary-%s/Packages.%s" % (self.security_apt_url, release_name, component, architecture, package_filetype)
+                    if package_filetype == 'xz':
+                        packages = deb822.Deb822.iter_paragraphs(lzma.decompress(requests.get(packages_url).content).decode("utf-8"))
+                    elif package_filetype == 'bz2':
+                        packages = deb822.Deb822.iter_paragraphs(bz2.decompress(requests.get(packages_url).content).decode("utf-8"))
+                    else:
+                        #TODO add support for other things
+                        packages = deb822.Deb822.iter_paragraphs(bz2.decompress(requests.get(packages_url).content).decode("utf-8"))
+
+
                     for binary_package in packages:
                         source_field = binary_package.get('Source', binary_package['Package']).split()
                         source_package_name = source_field[0]
@@ -143,65 +214,72 @@ class DebianFeed(object):
 
                         source_packages[source_package_key][binary_package['Package']][architecture] = binary_package['Version']
 
-        print "OK"
-        print "  Updating security-tracker data...",
+        print("OK")
+        print("  Updating security-tracker data... ", end='')
 
         self._update_svn_repository()
         svn_advisories = self._parse_svn_advisories()
-        print "OK"
+        print("OK")
 
         # make a set of the advisory IDs which exist on disk but not in the database
         new_advisories = set(svn_advisories) - set([advisory.upstream_id for advisory in Advisory.objects.filter(source='debian')])
 
-        print "  Found %i new DSAs to download" % len(new_advisories)
+        print("  Found %i new DSAs/DLAs to download" % len(new_advisories))
 
         for advisory in new_advisories:
-            print "    Downloading %s..." % advisory,
+            print("    Downloading %s... " % advisory, end='')
             search_packages = set()
             description = svn_advisories[advisory]['description']
             description = description[0].upper() + description[1:]
+            base_dsa_name = '-'.join(advisory.lower().split('-')[0:2])
+            long_description = dsa_descriptions.get(base_dsa_name, '')
 
-            db_advisory = Advisory(upstream_id=advisory, source="debian", issued=svn_advisories[advisory]['issued'], short_description=description)
-            db_advisory.save()
-            for package, versions in svn_advisories[advisory]['packages'].iteritems():
-                for release, version in versions.iteritems():
-                    # make the source package object
-                    db_srcpackage = SourcePackage(advisory=db_advisory, package=package, release=release, safe_version=version)
-                    db_srcpackage.save()
-                    search_packages.add(package)
-                    search_packages.add(version)
+            with transaction.atomic():
+                db_advisory = Advisory(upstream_id=advisory, source="debian", issued=svn_advisories[advisory]['issued'], short_description=description, description=long_description)
+                db_advisory.save()
+                for package, versions in svn_advisories[advisory]['packages'].items():
+                    for release, version in versions.items():
+                        # make the source package object
+                        db_srcpackage = SourcePackage(advisory=db_advisory, package=package, release=release, safe_version=version)
+                        db_srcpackage.save()
+                        search_packages.add(package)
+                        search_packages.add(version)
 
-                    # attempt by convoluted means to get the binary packages for that source package
-                    try:
-                        if (release, package, version) in source_packages: # package is current so in the repo
-                            for binary_package_name, binary_package_architectures in source_packages[(release, package, version)].iteritems():
-                                for architecture in binary_package_architectures:
-                                    db_binpackage = BinaryPackage(source_package=db_srcpackage, advisory=db_advisory, package=binary_package_name, release=release, safe_version=version, architecture=architecture)
-                                    db_binpackage.save()
-                                    search_packages.add(binary_package_name)
-                                    search_packages.add(version)
-                        else: # package is not latest in the repo, hopefully it's on snapshots.d.o
-                            snapshot_url = "%s/mr/package/%s/%s/allfiles" % (self.snapshot_url, package, version)
-                            snapshot_response = requests.get(snapshot_url)
-                            snapshot_data = json.loads(snapshot_response.text)
 
-                            if snapshot_data['version'] != version:
-                                raise Exception("snapshots.d.o returned non-matching result")
+                        # attempt by convoluted means to get the binary packages for that source package
+                        try:
+                            if (release, package, version) in source_packages: # package is current so in the repo
+                                logging.debug("source package: " + str(source_packages[(release, package, version)]))
+                                for binary_package_name, binary_package_architectures in source_packages[(release, package, version)].items():
+                                    for architecture in binary_package_architectures:
+                                        binversion = source_packages[(release, package, version)][binary_package_name][architecture]
+                                        db_binpackage = BinaryPackage(source_package=db_srcpackage, advisory=db_advisory, package=binary_package_name, release=release, safe_version=binversion, architecture=architecture)
+                                        db_binpackage.save()
+                                        search_packages.add(binary_package_name)
+                                        search_packages.add(version)
+                            else: # package is not latest in the repo, hopefully it's on snapshots.d.o
+                                snapshot_url = "%s/mr/package/%s/%s/allfiles" % (self.snapshot_url, package, version)
+                                snapshot_response = requests.get(snapshot_url)
+                                snapshot_data = snapshot_response.json()
+                                if snapshot_data['version'] != version:
+                                    raise Exception("snapshots.d.o returned non-matching result")
 
-                            for snapshot_binary in snapshot_data['result']['binaries']:
-                                snapshot_binary_architectures = [file['architecture'] for file in snapshot_binary['files'] if file['architecture'] in self.architectures]
-                                for architecture in snapshot_binary_architectures:
-                                    db_binpackage = BinaryPackage(source_package=db_srcpackage, advisory=db_advisory, package=snapshot_binary['name'], release=release, safe_version=snapshot_binary['version'], architecture=architecture)
-                                    db_binpackage.save()
-                                    search_packages.add(snapshot_binary['name'])
-                                    search_packages.add(snapshot_binary['version'])
+                                for snapshot_binary in snapshot_data['result']['binaries']:
+                                    snapshot_binary_architectures = [file['architecture'] for file in snapshot_binary['files'] if file['architecture'] in self.architectures]
+                                    for architecture in snapshot_binary_architectures:
+                                        db_binpackage = BinaryPackage(source_package=db_srcpackage, advisory=db_advisory, package=snapshot_binary['name'], release=release, safe_version=snapshot_binary['version'], architecture=architecture)
+                                        db_binpackage.save()
+                                        search_packages.add(snapshot_binary['name'])
+                                        search_packages.add(snapshot_binary['version'])
 
-                        db_advisory.search_keywords = " ".join(search_packages)
-                        db_advisory.save()
+                            db_advisory.search_keywords = " ".join(search_packages)
+                            db_advisory.save()
 
-                        print "OK"
-                    except:
-                        print "could not get binary packages for %s/%s, assuming there are none" % (release, package)
+                            print("OK")
+                        except KeyboardInterrupt:
+                            raise
+                        except:
+                            print("could not get binary packages for %s/%s, assuming there are none" % (release, package))
 
 class UbuntuFeed(object):
     """
@@ -214,6 +292,7 @@ class UbuntuFeed(object):
         self.releases = releases or (
             'precise',
             'trusty',
+            'xenial',
         )
         self.architectures = architectures or (
             'i386',
@@ -264,15 +343,16 @@ class UbuntuFeed(object):
         """
         Retrieve the latest JSON data, parse it and add any new advisories to the local database.
         """
-        print "  Downloading JSON data..."
+        print("  Downloading JSON data...")
         self._update_json_advisories()
         json_advisories = self._parse_json_advisories()
         new_advisories = set(json_advisories) - set(['-'.join(advisory.upstream_id.split('-')[1:]) for advisory in Advisory.objects.filter(source='ubuntu')])
 
-        print "  Found %i new USNs to process" % len(new_advisories)
+        print("  Found %i new USNs to process" % len(new_advisories))
+
 
         for advisory in new_advisories:
-            print "    Processing USN %s..." % advisory,
+            print("    Processing USN %s... " % advisory, end='')
 
             search_packages = set()
 
@@ -287,32 +367,39 @@ class UbuntuFeed(object):
                     short_description=advisory_data.get('isummary', None)
                 )
                 db_advisory.save()
-                for release, release_data in {release:release_data for release, release_data in json_advisories[advisory]['releases'].iteritems() if release in self.releases}.iteritems():
-                    for package, package_data in release_data['sources'].items():
-                        db_srcpackage = SourcePackage(advisory=db_advisory, package=package, release=release, safe_version=package_data['version'])
+
+                for release, release_data in {release:release_data for release, release_data in json_advisories[advisory]['releases'].items() if release in self.releases}.items():
+
+                    # Source packages
+                    for src_package, src_package_data in release_data['sources'].items():
+                        db_srcpackage = SourcePackage(advisory=db_advisory, package=src_package, release=release, safe_version=src_package_data['version'])
                         db_srcpackage.save()
-                        search_packages.add(package)
-                        search_packages.add(package_data['version'])
-                    for architecture in [architecture for architecture in release_data['archs'].keys() if architecture in self.architectures]:
-                        for url in release_data['archs'][architecture]['urls'].keys():
-                            package_filename = url.split('/')[-1]
-                            if not package_filename.endswith('.deb'):
-                                continue
-                            binary_package_name = package_filename.split('_')[0]
-                            if not binary_package_name in release_data['binaries'].keys():
-                                continue
-                            binary_package_version = package_filename.split('_')[1]
-                            db_binpackage = BinaryPackage(advisory=db_advisory, package=binary_package_name, release=release, safe_version=binary_package_version, architecture=architecture)
-                            db_binpackage.save()
-                            search_packages.add(binary_package_name)
-                            search_packages.add(binary_package_version)
+                        search_packages.add(src_package)
+                        search_packages.add(src_package_data['version'])
+
+                    # Binary packages
+                    for bin_package, bin_package_data in release_data['binaries'].items():
+                        bin_package_version = bin_package_data['version']
+
+                        # Goes through the architectures to see if the binary package is in them
+                        for architecture in [architecture for architecture in release_data.get('archs', {'none': 'dummy'}).keys() if architecture in self.architectures]:
+                            for url in release_data['archs'][architecture]['urls'].keys():
+
+                                # If binary package is in architecture, add package to db
+                                if bin_package == url.split('/')[-1].split('_')[0]:
+                                    # Adds a binary package in db for each architecture
+                                    db_binpackage = BinaryPackage(advisory=db_advisory, package=bin_package, release=release, safe_version=bin_package_version, architecture=architecture)
+                                    db_binpackage.save()
+                                    search_packages.add(bin_package)
+                                    search_packages.add(bin_package_version)
+
                 db_advisory.search_keywords = " ".join(search_packages)
                 db_advisory.save()
             except:
-                print "Error"
+                print("Error")
                 raise
             else:
-                print "OK"
+                print("OK")
 
 class Command(BaseCommand):
     help = 'Update all sources of advisories'
@@ -321,6 +408,11 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING("Updating DSAs..."))
         feed = DebianFeed()
         feed.update_local_database()
+
         self.stdout.write(self.style.MIGRATE_HEADING("Updating USNs..."))
         feed = UbuntuFeed()
+        feed.update_local_database()
+
+        self.stdout.write(self.style.MIGRATE_HEADING("Updating DLAs..."))
+        feed = DebianFeed(cache_location='%s/advisory_cache/dla' % settings.BASE_DIR, list_location='data/DLA/list')
         feed.update_local_database()

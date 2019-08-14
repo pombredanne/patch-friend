@@ -8,8 +8,6 @@
 {% block title %}Advisory list{% endblock %}
 
 {% block content %}
-    <h2>Newest advisories</h2>
-
     <form class="separate-from-above form-inline" method="GET">
         <div class="search-field-group form-group pull-right has-feedback">
             <input type="text" class="hasclear form-control" placeholder="Search..." name="q" value="{{ q }}">
@@ -44,26 +42,33 @@
             </tr>
         </thead>
         <tbody>
+            {# Creates a row for every advisory #}
             {% for advisory in object_list %}
                 {% regroup advisory.sourcepackage_set.all|dictsort:'release' by release as release_list %}
                 {% regroup advisory.sourcepackage_set.all by package as source_package_list %}
 
-                <tr class="{% if advisory.affected_hosts.count == 0 %}uninteresting{% else %} {% if not advisory.unresolved_hosts %}completed{% endif %}{% endif %}">
+                <tr class="{% if advisory.affected_hosts.distinct.count == 0 %}uninteresting{% else %} {% if not advisory.unresolved_hosts %}completed{% endif %}{% endif %}">
                     <td class="advisory-upstream-id"><img class="distro-icon" src="{% static 'reporting/icons/'|add:advisory.source|add:'.png' %}" alt="{{ advisory.source|advisory_source }}"><a href="{{ advisory.get_absolute_url }}">{{ advisory.upstream_id }}</a></td>
+
                     <td>{{ advisory.short_description }}</td>
-                    <td>
+
+                    <td> {# All releases that an advisory applies to #}
                         {% for release in release_list %}
                             {{ release.grouper }}{% if not forloop.last %}, {% endif %}
                         {% endfor %}
                     </td>
-                    <td>
+
+                    <td> {# All source packages that an advisory applies to #}
                         {% for package in source_package_list %}
                             <span class="package-name">{{ package.grouper }}</span>{% if not forloop.last %}, {% endif %}
                         {% endfor %}
                     </td>
+
                     <td class="{{ advisory.severity|advisory_severity_class }}">{{ advisory.severity|advisory_severity }}</td>
+
                     <td class="advisory-issued">{{ advisory.issued|date:"Y-m-d" }}</td>
-                    <td>
+
+                    <td> {# A progress bar showing the amount of hosts that have been patched. #}
                         <div class="progress">
                             <div class="progress-bar progress-bar-info" role="progressbar" style="width: {% if advisory.resolved_hosts %}{{ advisory.resolved_hosts_percentage }}{% else %}0{% endif %}%">
                             </div>
@@ -71,8 +76,9 @@
                             </div>
                         </div>
                     </td>
-                    <td style="white-space: nowrap;">
-                        {% if advisory.resolved_hosts %}{{ advisory.resolved_hosts.count }} ⁄ {% endif %}{% if advisory.affected_hosts %}{{ advisory.affected_hosts.count }}{% endif %}
+
+                    <td style="white-space: nowrap;"> {# Fraction of how many hosts have been patched #}
+                        {% if advisory.resolved_hosts %}{{ advisory.resolved_hosts.count }} ⁄ {% endif %}{% if advisory.affected_hosts %}{{ advisory.affected_hosts.distinct.count }}{% endif %}
                     </td>
                 </tr>
             {% endfor %}
@@ -80,6 +86,6 @@
     </table>
 
     <div class="text-center">
-        {% bootstrap_pagination page_obj extra=pagination_extra %}
+        {% bootstrap_pagination page_obj extra=request.GET.urlencode %}
     </div>
 {% endblock %}

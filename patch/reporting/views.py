@@ -1,14 +1,63 @@
 import collections, csv
-from urllib import urlencode
 
 from django.conf import settings
-from django.shortcuts import render, get_object_or_404
-from django.views import generic
-from django.http import HttpResponse
+from django.db.models import Q, Count, Case, When, IntegerField, OuterRef, Subquery
+from django.db.models.functions import Coalesce
 from django.forms import model_to_dict
+from django.http import HttpResponse
+from django.shortcuts import render, get_object_or_404
+from django.utils import timezone
+from django.views import generic
 from extra_views import SearchableListMixin
 
 from advisories.models import *
+from hosts.models import Customer
+
+class OverviewView(generic.TemplateView):
+    template_name = "reporting/overview.html"
+
+class HostIndexView(SearchableListMixin, generic.ListView):
+    model = Host
+    template_name = "reporting/host_list.html"
+    paginate_by = 25
+    search_fields = ['name']
+
+    def get_queryset(self, **kwargs):
+        queryset = super(HostIndexView, self).get_queryset(**kwargs)
+        if 'customer' in self.request.GET and len(self.request.GET['customer']) > 0:
+            queryset = queryset.filter(customer__name=self.request.GET['customer'])
+
+        queryset = queryset.annotate(
+            problem_count=Coalesce(Subquery(
+                Problem.objects.filter(
+                    fixed__isnull=True,
+                    host=OuterRef('pk')
+                ).values('host')
+                .annotate(cnt=Count('pk'))
+                .values('cnt'),
+                output_field=IntegerField()
+            ), 0)
+        ).order_by('-problem_count')
+
+        return queryset
+
+    def get_paginate_by(self, queryset):
+        return self.request.GET.get('paginate_by', self.paginate_by)
+
+    def get_context_data(self, **kwargs):
+        context = super(HostIndexView, self).get_context_data(**kwargs)
+        context['customer_list'] = Customer.objects.order_by('name').distinct()
+        context['paginate_by'] = self.request.GET.get('paginate_by', self.paginate_by)
+        context['q'] = self.request.GET.get('q', '')
+        context['request_customer'] = self.request.GET.get('customer', '')
+        context['pagination_extra'] = context['q']
+        return context
+
+class HostDetailView(generic.DetailView):
+    model = Host
+    slug_field = "name"
+    template_name = "reporting/host_detail.html"
+
 
 class AdvisoryIndexView(SearchableListMixin, generic.ListView):
     model = Advisory
@@ -23,7 +72,6 @@ class AdvisoryIndexView(SearchableListMixin, generic.ListView):
         context = super(AdvisoryIndexView, self).get_context_data(**kwargs)
         context['paginate_by'] = self.request.GET.get('paginate_by', self.paginate_by)
         context['q'] = self.request.GET.get('q', '')
-        context['pagination_extra'] = urlencode({'q': context['q'], 'paginate_by': context['paginate_by']})
         return context
 
 class AdvisoryDetailView(generic.DetailView):
@@ -47,7 +95,8 @@ class AdvisoryDetailView(generic.DetailView):
             binary_packages[package.release][package_key]['architectures'].append(package.architecture)
 
         unresolved_hosts = []
-        for host in context['object'].unresolved_hosts():
+
+        for host in context['object'].unresolved_hosts().distinct():
             host_dict = {}
             host_dict['tag_group'] = host.tag_group()
             host_dict.update(model_to_dict(host))
